@@ -7,6 +7,7 @@ real device is a canary step, not a CI step.
 
 from __future__ import annotations
 
+import asyncio
 import struct
 import sys
 import threading
@@ -179,6 +180,8 @@ def test_explicit_devices_skip_pulse_echo_module(monkeypatch):
 
     assert sd.input_stream.kwargs["device"] == "microphone"
     assert sd.output_stream.kwargs["device"] == "speaker"
+    assert sd.input_stream.kwargs["blocksize"] == talk_audio.SAMPLE_RATE // 50
+    assert sd.output_stream.kwargs["blocksize"] == talk_audio.SAMPLE_RATE // 50
     audio.stop()
 
 
@@ -232,6 +235,23 @@ def test_input_chunks_round_trip():
 
     assert audio.read_input_chunk() == b"\x01\x02"
     assert audio.read_input_chunk() is None
+
+
+@pytest.mark.asyncio
+async def test_async_input_reader_wakes_from_audio_callback_thread():
+    audio = talk_audio.DuplexAudio()
+    pending = asyncio.create_task(audio.read_input_chunk_async())
+    await asyncio.sleep(0)
+    pcm = b"\x01\x02"
+    callback = threading.Thread(
+        target=audio._input_callback,
+        args=(pcm, 1, None, None),
+    )
+
+    callback.start()
+    callback.join()
+
+    assert await asyncio.wait_for(pending, timeout=0.1) == pcm
 
 def _pcm16(amplitude: int, frames: int = 32) -> bytes:
     return struct.pack(f"<{frames}h", *([amplitude] * frames))

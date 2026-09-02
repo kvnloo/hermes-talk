@@ -383,11 +383,15 @@ async def run_core_talk_session(audio=None) -> int:
         print(f"talk: state {state}", flush=True)
 
     async def send_microphone() -> None:
+        read_async = getattr(audio, "read_input_chunk_async", None)
         while True:
-            chunk = audio.read_input_chunk()
-            if chunk is None:
-                await asyncio.sleep(IDLE_POLL_S)
-                continue
+            if read_async is None:
+                chunk = audio.read_input_chunk()
+                if chunk is None:
+                    await asyncio.sleep(IDLE_POLL_S)
+                    continue
+            else:
+                chunk = await read_async()
             await coordinator.send_audio(chunk)
             report_audio_pressure()
 

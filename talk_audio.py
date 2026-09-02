@@ -5,10 +5,10 @@ import cleanly on a headless box with no PortAudio, and the audio extra is
 optional (``pip install "hermes-talk[audio]"``). Same pattern Hermes uses in
 ``tools/voice_mode.py``.
 
-The PortAudio callbacks run on their own thread and touch nothing but plain
-queues — no asyncio, no locks held across a device call. The async session
-polls :meth:`DuplexAudio.read_input_chunk` and pushes with
-:meth:`DuplexAudio.queue_playback`.
+The PortAudio callbacks run on their own thread and touch only bounded queues.
+The async session waits on a thread-safe wakeup from
+:meth:`DuplexAudio.read_input_chunk_async`; legacy callers can still poll
+:meth:`DuplexAudio.read_input_chunk`. Playback remains callback-driven.
 
 :attr:`DuplexAudio.played_ms` counts audio actually handed to the speaker,
 which is what a barge-in truncate has to be measured in: the server has
@@ -17,6 +17,7 @@ already generated far more than the operator heard.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import math
 import os
@@ -36,7 +37,7 @@ except ImportError:  # pragma: no cover - flat-module fallback (Hermes file-path
 SAMPLE_RATE = 24_000
 CHANNELS = 1
 SAMPLE_WIDTH = 2
-BLOCKSIZE = 2_400  # 100 ms at 24 kHz
+BLOCKSIZE = 480  # 20 ms at 24 kHz
 FRAME_BYTES = SAMPLE_WIDTH * CHANNELS
 
 #: Bounded so a stalled reader cannot grow the process without limit. Input is
@@ -240,6 +241,8 @@ class DuplexAudio:
         self._in_stream = None
         self._out_stream = None
         self._pulse_webrtc = _PulseWebRtcAudio()
+        self._input_loop: asyncio.AbstractEventLoop | None = None
+        self._input_ready: asyncio.Event | None = None
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -325,8 +328,8 @@ class DuplexAudio:
         try:
             self._input.put_nowait(pcm)
         except queue.Full:
-            # Capture is realtime: preserving a five-second-old block while
-            # discarding the operator's current speech corrupts the turn.
+            # Capture is realtime: preserving old queued audio while discarding
+            # the operator's current speech corrupts the turn.
             # Evict one oldest block and retain the newest available audio.
             with contextlib.suppress(queue.Empty):
                 self._input.get_nowait()
@@ -334,6 +337,11 @@ class DuplexAudio:
                 self._input.put_nowait(pcm)
             with self._lock:
                 self._dropped_input_blocks += 1
+        loop = self._input_loop
+        ready = self._input_ready
+        if loop is not None and ready is not None:
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(ready.set)
 
     def _output_callback(self, outdata, frames, _time, _status) -> None:
         wanted = frames * FRAME_BYTES
@@ -381,6 +389,26 @@ class DuplexAudio:
             return self._input.get_nowait()
         except queue.Empty:
             return None
+
+    async def read_input_chunk_async(self) -> bytes:
+        """Wait without polling until the audio callback captures a block."""
+
+        loop = asyncio.get_running_loop()
+        if self._input_loop is None:
+            self._input_loop = loop
+            self._input_ready = asyncio.Event()
+        elif self._input_loop is not loop:
+            raise RuntimeError("DuplexAudio input cannot move between event loops")
+        assert self._input_ready is not None
+        while True:
+            chunk = self.read_input_chunk()
+            if chunk is not None:
+                return chunk
+            self._input_ready.clear()
+            chunk = self.read_input_chunk()
+            if chunk is not None:
+                return chunk
+            await self._input_ready.wait()
 
     def queue_playback(self, pcm: bytes, item_id: str | None = None) -> None:
         """Queue model audio for the speaker. Drops on overflow, never blocks."""

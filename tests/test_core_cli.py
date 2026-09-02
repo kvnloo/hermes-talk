@@ -391,6 +391,56 @@ def test_stdin_reader_discards_queued_frames_after_parent_flood():
     asyncio.run(scenario())
 
 
+def test_core_microphone_sender_uses_event_driven_audio_reader(
+    monkeypatch, capsys
+):
+    class AsyncAudio(FakeAudio):
+        def __init__(self):
+            super().__init__()
+            self.async_reads = 0
+
+        def read_input_chunk(self):
+            raise AssertionError("polling reader must not run")
+
+        async def read_input_chunk_async(self):
+            self.async_reads += 1
+            if self.async_reads == 1:
+                return b"fresh-pcm"
+            await asyncio.Event().wait()
+
+    class AudioCoordinator(FakeCoordinator):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.sent_audio = []
+            self.audio_received = asyncio.Event()
+
+        async def send_audio(self, pcm):
+            self.sent_audio.append(pcm)
+            self.audio_received.set()
+
+        async def events(self):
+            await self.audio_received.wait()
+            if False:  # pragma: no cover - make this an async iterator
+                yield None
+
+    class OpenParent:
+        async def wait_for_parent_close(self, _delegation_idle):
+            await asyncio.Event().wait()
+
+        def close(self):
+            pass
+
+    audio = AsyncAudio()
+    capture = FakeCapture(None)
+    configure_event_stream(monkeypatch, capture, AudioCoordinator)
+    monkeypatch.setattr(talk_core_cli, "_StdinLineReader", OpenParent)
+
+    assert asyncio.run(talk_core_cli.run_core_talk_session(audio)) == 1
+    assert audio.async_reads >= 1
+    assert FakeCoordinator.instance.sent_audio == [b"fresh-pcm"]
+    assert "closed unexpectedly" in capsys.readouterr().out
+
+
 def test_parent_stdin_eof_stops_an_idle_session(monkeypatch, capsys):
     class IdleCoordinator(FakeCoordinator):
         async def events(self):
