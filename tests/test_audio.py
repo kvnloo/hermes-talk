@@ -253,6 +253,41 @@ async def test_async_input_reader_wakes_from_audio_callback_thread():
 
     assert await asyncio.wait_for(pending, timeout=0.1) == pcm
 
+
+def test_timed_input_preserves_callback_delivery_time(monkeypatch):
+    audio = talk_audio.DuplexAudio()
+    monkeypatch.setattr(audio, "_clock", lambda: 12.5)
+
+    audio._input_callback(b"\x01\x02", 1, None, None)
+
+    assert audio.read_input_chunk_timed() == talk_audio.CapturedAudio(
+        data=b"\x01\x02",
+        captured_at=12.5,
+    )
+
+
+@pytest.mark.asyncio
+async def test_playback_timing_reports_first_device_callback(monkeypatch):
+    audio = talk_audio.DuplexAudio()
+    timestamps = iter((20.0, 20.007))
+    monkeypatch.setattr(audio, "_clock", lambda: next(timestamps))
+    audio.queue_playback_timed(
+        b"\x01\x02",
+        item_id="item-1",
+        turn_end_event_at=19.5,
+    )
+    pending = asyncio.create_task(audio.read_playback_timing_async())
+    await asyncio.sleep(0)
+
+    audio._output_callback(_Buffer(2), 1, None, None)
+
+    assert await asyncio.wait_for(pending, timeout=0.1) == talk_audio.PlaybackTiming(
+        item_id="item-1",
+        received_at=20.0,
+        started_at=20.007,
+        turn_end_event_at=19.5,
+    )
+
 def _pcm16(amplitude: int, frames: int = 32) -> bytes:
     return struct.pack(f"<{frames}h", *([amplitude] * frames))
 

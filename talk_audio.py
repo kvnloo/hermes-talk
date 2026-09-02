@@ -26,7 +26,9 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import uuid
+from dataclasses import dataclass
 from typing import ClassVar
 
 try:
@@ -45,6 +47,7 @@ FRAME_BYTES = SAMPLE_WIDTH * CHANNELS
 MAX_INPUT_BLOCKS = 50
 MAX_PLAYBACK_BLOCKS = 200
 MAX_PLAYBACK_BYTES = SAMPLE_RATE * FRAME_BYTES * 20
+MAX_PLAYBACK_TIMINGS = 64
 
 # Match OMP's live controller: while model audio is playing, microphone blocks
 # below the acoustic echo floor are local playback leakage, not barge-in.
@@ -60,6 +63,23 @@ _INSTALL_HINT = (
 
 class TalkAudioError(Exception):
     """Audio devices are unusable."""
+
+@dataclass(frozen=True, slots=True)
+class CapturedAudio:
+    """One PCM block and when PortAudio delivered it to the process."""
+
+    data: bytes
+    captured_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class PlaybackTiming:
+    """When the first bytes of one provider item reached the device callback."""
+
+    item_id: str
+    received_at: float
+    started_at: float
+    turn_end_event_at: float | None
 
 
 def import_sounddevice():
@@ -226,11 +246,13 @@ class DuplexAudio:
     _startup_lock: ClassVar[threading.Lock] = threading.Lock()
 
     def __init__(self) -> None:
-        self._input: queue.Queue[bytes] = queue.Queue(maxsize=MAX_INPUT_BLOCKS)
-        self._playback: queue.Queue[tuple[str | None, bytes]] = queue.Queue(
-            maxsize=MAX_PLAYBACK_BLOCKS
+        self._input: queue.Queue[CapturedAudio] = queue.Queue(
+            maxsize=MAX_INPUT_BLOCKS
         )
-        self._residual: tuple[str | None, bytes] | None = None
+        self._playback: queue.Queue[
+            tuple[str | None, bytes, float, float | None]
+        ] = queue.Queue(maxsize=MAX_PLAYBACK_BLOCKS)
+        self._residual: tuple[str | None, bytes, float, float | None] | None = None
         self._queued_playback_bytes = 0
         self._lock = threading.Lock()
         self._played_item_id: str | None = None
@@ -241,8 +263,14 @@ class DuplexAudio:
         self._in_stream = None
         self._out_stream = None
         self._pulse_webrtc = _PulseWebRtcAudio()
+        self._clock = time.monotonic
         self._input_loop: asyncio.AbstractEventLoop | None = None
         self._input_ready: asyncio.Event | None = None
+        self._playback_timings: queue.Queue[PlaybackTiming] = queue.Queue(
+            maxsize=MAX_PLAYBACK_TIMINGS
+        )
+        self._playback_loop: asyncio.AbstractEventLoop | None = None
+        self._playback_ready: asyncio.Event | None = None
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -313,7 +341,8 @@ class DuplexAudio:
     # -- PortAudio callbacks (audio thread) -----------------------------------
 
     def _input_callback(self, indata, _frames, _time, _status) -> None:
-        pcm = bytes(indata)
+        captured = CapturedAudio(bytes(indata), self._clock())
+        pcm = captured.data
         input_level = _pcm16_rms(pcm)
         with self._lock:
             output_level = self._output_level
@@ -326,7 +355,7 @@ class DuplexAudio:
             if output_active and input_level < echo_threshold:
                 return
         try:
-            self._input.put_nowait(pcm)
+            self._input.put_nowait(captured)
         except queue.Full:
             # Capture is realtime: preserving old queued audio while discarding
             # the operator's current speech corrupts the turn.
@@ -334,7 +363,7 @@ class DuplexAudio:
             with contextlib.suppress(queue.Empty):
                 self._input.get_nowait()
             with contextlib.suppress(queue.Full):
-                self._input.put_nowait(pcm)
+                self._input.put_nowait(captured)
             with self._lock:
                 self._dropped_input_blocks += 1
         loop = self._input_loop
@@ -365,7 +394,7 @@ class DuplexAudio:
                     packet = self._playback.get_nowait()
                 except queue.Empty:
                     break
-            item_id, data = packet
+            item_id, data, received_at, turn_end_event_at = packet
             taken = data[:remaining]
             parts.append(taken)
             self._queued_playback_bytes -= len(taken)
@@ -374,24 +403,55 @@ class DuplexAudio:
                 if item_id != self._played_item_id:
                     self._played_item_id = item_id
                     self._played_frames = 0
+                    if item_id is not None:
+                        self._record_playback_timing(
+                            PlaybackTiming(
+                                item_id=item_id,
+                                received_at=received_at,
+                                started_at=self._clock(),
+                                turn_end_event_at=turn_end_event_at,
+                            )
+                        )
                 self._played_frames += played_frames
             remaining -= len(taken)
-            packet = (item_id, data[len(taken) :]) if len(taken) < len(data) else None
+            packet = (
+                (item_id, data[len(taken) :], received_at, turn_end_event_at)
+                if len(taken) < len(data)
+                else None
+            )
         self._residual = packet
         return b"".join(parts)
 
+    def _record_playback_timing(self, timing: PlaybackTiming) -> None:
+        if self._playback_timings.full():
+            with contextlib.suppress(queue.Empty):
+                self._playback_timings.get_nowait()
+        with contextlib.suppress(queue.Full):
+            self._playback_timings.put_nowait(timing)
+        loop = self._playback_loop
+        ready = self._playback_ready
+        if loop is not None and ready is not None:
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(ready.set)
+
     # -- session interface ----------------------------------------------------
 
-    def read_input_chunk(self) -> bytes | None:
-        """One captured block, or ``None`` when the microphone has nothing yet."""
+    def read_input_chunk_timed(self) -> CapturedAudio | None:
+        """One timestamped capture block, or ``None`` when input is empty."""
 
         try:
             return self._input.get_nowait()
         except queue.Empty:
             return None
 
-    async def read_input_chunk_async(self) -> bytes:
-        """Wait without polling until the audio callback captures a block."""
+    def read_input_chunk(self) -> bytes | None:
+        """One captured block, or ``None`` when the microphone has nothing yet."""
+
+        captured = self.read_input_chunk_timed()
+        return None if captured is None else captured.data
+
+    async def read_input_chunk_timed_async(self) -> CapturedAudio:
+        """Wait without polling for a timestamped audio capture block."""
 
         loop = asyncio.get_running_loop()
         if self._input_loop is None:
@@ -401,30 +461,83 @@ class DuplexAudio:
             raise RuntimeError("DuplexAudio input cannot move between event loops")
         assert self._input_ready is not None
         while True:
-            chunk = self.read_input_chunk()
-            if chunk is not None:
-                return chunk
+            captured = self.read_input_chunk_timed()
+            if captured is not None:
+                return captured
             self._input_ready.clear()
-            chunk = self.read_input_chunk()
-            if chunk is not None:
-                return chunk
+            captured = self.read_input_chunk_timed()
+            if captured is not None:
+                return captured
             await self._input_ready.wait()
 
-    def queue_playback(self, pcm: bytes, item_id: str | None = None) -> None:
-        """Queue model audio for the speaker. Drops on overflow, never blocks."""
+    async def read_input_chunk_async(self) -> bytes:
+        """Wait without polling until the audio callback captures a block."""
 
+        return (await self.read_input_chunk_timed_async()).data
+
+    def _queue_playback(
+        self,
+        pcm: bytes,
+        *,
+        item_id: str | None,
+        turn_end_event_at: float | None,
+    ) -> None:
         if not pcm:
             return
+        received_at = self._clock()
         with self._lock:
             if self._queued_playback_bytes + len(pcm) > MAX_PLAYBACK_BYTES:
                 self._dropped_playback_bytes += len(pcm)
                 return
             try:
-                self._playback.put_nowait((item_id, pcm))
+                self._playback.put_nowait(
+                    (item_id, pcm, received_at, turn_end_event_at)
+                )
             except queue.Full:
                 self._dropped_playback_bytes += len(pcm)
                 return
             self._queued_playback_bytes += len(pcm)
+
+    def queue_playback(self, pcm: bytes, item_id: str | None = None) -> None:
+        """Queue model audio for the speaker. Drops on overflow, never blocks."""
+
+        self._queue_playback(pcm, item_id=item_id, turn_end_event_at=None)
+
+    def queue_playback_timed(
+        self,
+        pcm: bytes,
+        *,
+        item_id: str | None,
+        turn_end_event_at: float | None,
+    ) -> None:
+        """Queue audio with the received turn-end timestamp for measurement."""
+
+        self._queue_playback(
+            pcm,
+            item_id=item_id,
+            turn_end_event_at=turn_end_event_at,
+        )
+
+    async def read_playback_timing_async(self) -> PlaybackTiming:
+        """Wait for the callback to start rendering a new provider audio item."""
+
+        loop = asyncio.get_running_loop()
+        if self._playback_loop is None:
+            self._playback_loop = loop
+            self._playback_ready = asyncio.Event()
+        elif self._playback_loop is not loop:
+            raise RuntimeError("DuplexAudio playback cannot move between event loops")
+        assert self._playback_ready is not None
+        while True:
+            try:
+                return self._playback_timings.get_nowait()
+            except queue.Empty:
+                pass
+            self._playback_ready.clear()
+            try:
+                return self._playback_timings.get_nowait()
+            except queue.Empty:
+                await self._playback_ready.wait()
 
     def drain_playback(self) -> tuple[str | None, int]:
         """Discard unheard audio and atomically return the heard boundary."""
@@ -480,7 +593,9 @@ __all__ = [
     "FRAME_BYTES",
     "SAMPLE_RATE",
     "SAMPLE_WIDTH",
+    "CapturedAudio",
     "DuplexAudio",
+    "PlaybackTiming",
     "TalkAudioError",
     "audio_available",
     "import_sounddevice",
