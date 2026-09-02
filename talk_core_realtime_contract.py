@@ -142,9 +142,17 @@ class TalkRealtimeSession(RealtimeSession):
             self._tool_call_responses[event.call_id] = event.response_id
             return RealtimeEvent.tool_call(event.call_id, event.name, arguments)
         if isinstance(event, rt.SpeechStarted):
-            return RealtimeEvent(type=RealtimeEventType.TURN_STARTED, role="user")
+            return RealtimeEvent(
+                type=RealtimeEventType.TURN_STARTED,
+                role="user",
+                offset_ms=event.offset_ms,
+            )
         if isinstance(event, rt.SpeechStopped):
-            return RealtimeEvent(type=RealtimeEventType.TURN_ENDED, role="user")
+            return RealtimeEvent(
+                type=RealtimeEventType.TURN_ENDED,
+                role="user",
+                offset_ms=event.offset_ms,
+            )
         if isinstance(event, rt.ResponseStarted):
             if not self._start_response(event.response_id):
                 return None

@@ -299,7 +299,7 @@ def test_tui_event_stream_delegates_to_text_agent_and_frames_transcripts(
     metrics = [frame for frame in frames if frame["type"] == "metric"]
     assert [metric["name"] for metric in metrics] == [
         "session_ready_ms",
-        "endpoint_to_first_audio_ms",
+        "turn_end_event_to_first_audio_receive_ms",
     ]
     assert all(metric["value_ms"] >= 0 for metric in metrics)
     canonical_frames = [
@@ -330,6 +330,12 @@ def test_progress_item_ids_stay_within_provider_wire_limit():
     assert first == f"p1-{request_id}"[:32]
     assert len(first) == talk_core_cli.MAX_PROVIDER_ITEM_ID_LENGTH
     assert first != second
+
+
+def test_nearest_rank_handles_single_and_small_sample_sets():
+    assert talk_core_cli._nearest_rank([4.0], 0.95) == 4.0
+    assert talk_core_cli._nearest_rank([9.0, 1.0, 5.0], 0.50) == 5.0
+    assert talk_core_cli._nearest_rank([9.0, 1.0, 5.0], 0.95) == 9.0
 
 
 def test_stdin_reader_consumes_prefetched_lines_without_deadlock():
@@ -389,6 +395,116 @@ def test_stdin_reader_discards_queued_frames_after_parent_flood():
             reader.close()
 
     asyncio.run(scenario())
+
+
+def test_core_emits_honest_capture_endpoint_and_playback_metrics(
+    monkeypatch, capsys
+):
+    class TelemetryAudio(FakeAudio):
+        def start(self):
+            super().start()
+            self.capture = talk_core_cli.talk_audio.CapturedAudio(
+                data=b"\x01\x00" * 480,
+                captured_at=talk_core_cli.time.monotonic() - 0.002,
+            )
+            self.capture_reads = 0
+            self.playback_timings = asyncio.Queue()
+            self.playback_timing_consumed = asyncio.Event()
+
+        async def read_input_chunk_timed_async(self):
+            self.capture_reads += 1
+            if self.capture_reads == 1:
+                return self.capture
+            await asyncio.Event().wait()
+
+        def queue_playback_timed(
+            self,
+            pcm,
+            *,
+            item_id,
+            turn_end_event_at,
+        ):
+            received_at = talk_core_cli.time.monotonic()
+            self.queued.append((item_id, pcm))
+            self.playback_timings.put_nowait(
+                talk_core_cli.talk_audio.PlaybackTiming(
+                    item_id=item_id,
+                    received_at=received_at,
+                    started_at=received_at + 0.005,
+                    turn_end_event_at=turn_end_event_at,
+                )
+            )
+
+        async def read_playback_timing_async(self):
+            timing = await self.playback_timings.get()
+            self.playback_timing_consumed.set()
+            return timing
+
+    audio = TelemetryAudio()
+
+    class TelemetryCoordinator(FakeCoordinator):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.audio_received = asyncio.Event()
+
+        async def send_audio(self, _pcm):
+            self.audio_received.set()
+
+        async def events(self):
+            await self.audio_received.wait()
+            yield identified(
+                RealtimeEvent(
+                    type=RealtimeEventType.TURN_ENDED,
+                    role="user",
+                    offset_ms=20,
+                ),
+                1,
+            )
+            yield identified(
+                RealtimeEvent.audio(b"speaker", item_id="item-1"),
+                2,
+            )
+            await audio.playback_timing_consumed.wait()
+            await asyncio.sleep(0)
+
+    class OpenParent:
+        async def wait_for_parent_close(self, _delegation_idle):
+            await asyncio.Event().wait()
+
+        def close(self):
+            pass
+
+    capture = FakeCapture(None)
+    configure_event_stream(monkeypatch, capture, TelemetryCoordinator)
+    monkeypatch.setattr(talk_core_cli, "_StdinLineReader", OpenParent)
+
+    assert asyncio.run(talk_core_cli.run_core_talk_session(audio)) == 1
+    frames = [
+        json.loads(line.removeprefix(talk_core_cli.EVENT_PREFIX))
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith(talk_core_cli.EVENT_PREFIX)
+    ]
+    metrics = {
+        frame["name"]: frame
+        for frame in frames
+        if frame["type"] == "metric"
+    }
+
+    assert set(metrics) == {
+        "first_audio_receive_to_playback_ms",
+        "microphone_capture_to_send_max_ms",
+        "microphone_capture_to_send_p50_ms",
+        "microphone_capture_to_send_p95_ms",
+        "speech_end_to_turn_end_event_ms",
+        "turn_end_event_to_first_audio_receive_ms",
+        "turn_end_event_to_playback_ms",
+    }
+    assert all(metric["value_ms"] >= 0 for metric in metrics.values())
+    assert [
+        metric["realtime_sequence"]
+        for metric in metrics.values()
+        if "realtime_sequence" in metric
+    ] == [1, 2]
 
 
 def test_core_microphone_sender_uses_event_driven_audio_reader(
@@ -517,7 +633,7 @@ def test_core_barge_in_uses_atomic_boundary_for_latest_played_item(
     interruption_metrics = [
         frame
         for frame in frames
-        if frame.get("name") == "interruption_to_local_silence_ms"
+        if frame.get("name") == "speech_start_event_to_local_silence_ms"
     ]
     assert len(interruption_metrics) == 1
     assert interruption_metrics[0]["value_ms"] >= 0

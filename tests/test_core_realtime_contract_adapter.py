@@ -196,6 +196,26 @@ def test_session_maps_audio_transcript_turns_and_tool_calls():
     assert events[3].arguments == {"city": "Paris"}
 
 
+
+def test_session_preserves_provider_speech_timeline_offsets():
+    harness = Harness(
+        (
+            rt.SpeechStarted(input_id="input-1", offset_ms=120),
+            rt.SpeechStopped(input_id="input-1", offset_ms=860),
+        )
+    )
+    session = core_v1.TalkRealtimeSession(harness.session)
+
+    async def collect():
+        return [event async for event in session.events()]
+
+    started, stopped = run(collect())
+
+    assert started.type is RealtimeEventType.TURN_STARTED
+    assert started.offset_ms == 120
+    assert stopped.type is RealtimeEventType.TURN_ENDED
+    assert stopped.offset_ms == 860
+
 def test_session_commands_preserve_host_authority_and_barge_in_boundary():
     harness = Harness(
         (
