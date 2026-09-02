@@ -7,11 +7,13 @@ import contextlib
 import io
 import json
 import logging
+import math
 import os
 import sys
 import threading
 import time
 import uuid
+from collections import deque
 
 from agent.realtime_voice import RealtimeEvent, RealtimeEventType
 from agent.realtime_voice_coordinator import RealtimeVoiceCoordinator
@@ -35,6 +37,7 @@ EVENT_STREAM_ENV = "HERMES_TALK_EVENT_STREAM"
 MAX_PROVIDER_ITEM_ID_LENGTH = 32
 MAX_CONTROL_FRAME_CHARS = 65_536
 MAX_PENDING_CONTROL_FRAMES = 64
+MAX_LATENCY_SAMPLES = 4_096
 PROTOCOL_VERSION = 1
 EVENT_PREFIX = "talk: event "
 DELEGATE_TOOL = {
@@ -82,6 +85,13 @@ def _progress_item_id(request_id: str, index: int) -> str:
     """Build a unique progress item id within provider wire limits."""
 
     return f"p{index:x}-{request_id}"[:MAX_PROVIDER_ITEM_ID_LENGTH]
+
+def _nearest_rank(values: list[float], percentile: float) -> float:
+    """Return a deterministic nearest-rank percentile for non-empty samples."""
+
+    ordered = sorted(values)
+    index = max(0, math.ceil(percentile * len(ordered)) - 1)
+    return ordered[index]
 
 class _StdinLineReader:
     """One owner for stdin buffering; POSIX stays event-driven."""
@@ -334,20 +344,66 @@ async def run_core_talk_session(audio=None) -> int:
     reported_playback_drops = 0
     user_endpoint_at: float | None = None
     session_open_started = 0.0
+    capture_latency_samples: deque[tuple[float, float]] = deque(
+        maxlen=MAX_LATENCY_SAMPLES
+    )
+    input_audio_timeline: deque[tuple[float, float]] = deque(
+        maxlen=MAX_LATENCY_SAMPLES
+    )
+    input_audio_end_ms = 0.0
+    playback_metric_sources: dict[str, RealtimeEvent | None] = {}
+
+    def emit_metric_value(
+        name: str,
+        value_ms: float,
+        source_event: RealtimeEvent | None = None,
+    ) -> None:
+        if value_ms < 0:
+            return
+        emit_event(
+            {
+                "type": "metric",
+                "name": name,
+                "value_ms": round(value_ms, 3),
+            },
+            source_event,
+        )
 
     def emit_metric(
         name: str,
         started_at: float,
         source_event: RealtimeEvent | None = None,
     ) -> None:
-        emit_event(
-            {
-                "type": "metric",
-                "name": name,
-                "value_ms": round((time.monotonic() - started_at) * 1000, 3),
-            },
+        emit_metric_value(
+            name,
+            (time.monotonic() - started_at) * 1000,
             source_event,
         )
+
+    def report_capture_latency(cutoff: float) -> None:
+        samples = []
+        while capture_latency_samples and capture_latency_samples[0][0] <= cutoff:
+            _, latency_ms = capture_latency_samples.popleft()
+            samples.append(latency_ms)
+        if not samples:
+            return
+        emit_metric_value(
+            "microphone_capture_to_send_p50_ms",
+            _nearest_rank(samples, 0.50),
+        )
+        emit_metric_value(
+            "microphone_capture_to_send_p95_ms",
+            _nearest_rank(samples, 0.95),
+        )
+        emit_metric_value("microphone_capture_to_send_max_ms", max(samples))
+
+    def capture_time_for_offset(offset_ms: int | None) -> float | None:
+        if offset_ms is None:
+            return None
+        for audio_end_ms, captured_at in input_audio_timeline:
+            if audio_end_ms >= offset_ms:
+                return captured_at
+        return None
 
     def report_audio_pressure() -> None:
         nonlocal reported_input_drops, reported_playback_drops
@@ -383,17 +439,48 @@ async def run_core_talk_session(audio=None) -> int:
         print(f"talk: state {state}", flush=True)
 
     async def send_microphone() -> None:
+        nonlocal input_audio_end_ms
+        read_timed = getattr(audio, "read_input_chunk_timed_async", None)
         read_async = getattr(audio, "read_input_chunk_async", None)
         while True:
-            if read_async is None:
+            captured_at: float | None = None
+            if read_timed is not None:
+                captured = await read_timed()
+                chunk = captured.data
+                captured_at = captured.captured_at
+            elif read_async is not None:
+                chunk = await read_async()
+            else:
                 chunk = audio.read_input_chunk()
                 if chunk is None:
                     await asyncio.sleep(IDLE_POLL_S)
                     continue
-            else:
-                chunk = await read_async()
             await coordinator.send_audio(chunk)
+            sent_at = time.monotonic()
+            if captured_at is not None:
+                capture_latency_samples.append(
+                    (sent_at, (sent_at - captured_at) * 1000)
+                )
+                frame_count = len(chunk) / talk_audio.FRAME_BYTES
+                input_audio_end_ms += frame_count * 1000 / talk_audio.SAMPLE_RATE
+                input_audio_timeline.append((input_audio_end_ms, captured_at))
             report_audio_pressure()
+
+    async def receive_playback_timings() -> None:
+        read_timing = audio.read_playback_timing_async
+        while True:
+            timing = await read_timing()
+            source_event = playback_metric_sources.pop(timing.item_id, None)
+            emit_metric_value(
+                "first_audio_receive_to_playback_ms",
+                (timing.started_at - timing.received_at) * 1000,
+                source_event,
+            )
+            if timing.turn_end_event_at is not None:
+                emit_metric_value(
+                    "turn_end_event_to_playback_ms",
+                    (timing.started_at - timing.turn_end_event_at) * 1000,
+                )
 
     async def receive_events() -> None:
         nonlocal last_audio_event, provider_ready, user_endpoint_at
@@ -423,10 +510,32 @@ async def run_core_talk_session(audio=None) -> int:
                 if not event.audio_bytes:
                     continue
                 emit_state("composing")
-                audio.queue_playback(event.audio_bytes, item_id=event.item_id)
+                turn_end_event_at = user_endpoint_at
+                queue_timed = getattr(audio, "queue_playback_timed", None)
+                if queue_timed is None:
+                    audio.queue_playback(event.audio_bytes, item_id=event.item_id)
+                else:
+                    if event.item_id:
+                        playback_metric_sources.setdefault(
+                            event.item_id,
+                            None if turn_end_event_at is not None else event,
+                        )
+                        while len(playback_metric_sources) > MAX_LATENCY_SAMPLES:
+                            playback_metric_sources.pop(
+                                next(iter(playback_metric_sources))
+                            )
+                    queue_timed(
+                        event.audio_bytes,
+                        item_id=event.item_id,
+                        turn_end_event_at=turn_end_event_at,
+                    )
                 report_audio_pressure()
-                if user_endpoint_at is not None:
-                    emit_metric("endpoint_to_first_audio_ms", user_endpoint_at, event)
+                if turn_end_event_at is not None:
+                    emit_metric(
+                        "turn_end_event_to_first_audio_receive_ms",
+                        turn_end_event_at,
+                        event,
+                    )
                     user_endpoint_at = None
                 last_audio_event = event
                 continue
@@ -448,6 +557,14 @@ async def run_core_talk_session(audio=None) -> int:
             if event.type is RealtimeEventType.TURN_ENDED:
                 if event.role == "user":
                     user_endpoint_at = time.monotonic()
+                    captured_endpoint_at = capture_time_for_offset(event.offset_ms)
+                    if captured_endpoint_at is not None:
+                        emit_metric_value(
+                            "speech_end_to_turn_end_event_ms",
+                            (user_endpoint_at - captured_endpoint_at) * 1000,
+                            event,
+                        )
+                    report_capture_latency(user_endpoint_at)
                     emit_state("solving")
                 elif event.role == "assistant":
                     emit_state("listening")
@@ -456,8 +573,10 @@ async def run_core_talk_session(audio=None) -> int:
                 if event.role == "assistant":
                     emit_state("composing")
                 elif event.role == "user" and last_audio_event is not None:
-                    interruption_started_at = time.monotonic()
+                    speech_start_event_at = time.monotonic()
+                    playback_metric_sources.clear()
                     played_item, played_ms = audio.drain_playback()
+                    local_silence_at = time.monotonic()
                     if (
                         played_item is not None
                         and played_item == last_audio_event.item_id
@@ -467,14 +586,18 @@ async def run_core_talk_session(audio=None) -> int:
                             last_audio_event,
                             audio_end_ms=played_ms,
                         )
-                    await coordinator.cancel_response()
-                    last_audio_event = None
-                    emit_state("listening")
-                    emit_metric(
-                        "interruption_to_local_silence_ms",
-                        interruption_started_at,
+                    emit_metric_value(
+                        "speech_start_event_to_local_silence_ms",
+                        (local_silence_at - speech_start_event_at) * 1000,
                         event,
                     )
+                    await coordinator.cancel_response()
+                    emit_metric_value(
+                        "speech_start_event_to_cancel_complete_ms",
+                        (time.monotonic() - speech_start_event_at) * 1000,
+                    )
+                    last_audio_event = None
+                    emit_state("listening")
                 continue
             if event.type is RealtimeEventType.ERROR:
                 raise RuntimeError(event.text or "realtime voice provider failed")
@@ -498,6 +621,8 @@ async def run_core_talk_session(audio=None) -> int:
                 stdin_reader.wait_for_parent_close(delegation_idle)
             ),
         ]
+        if callable(getattr(audio, "read_playback_timing_async", None)):
+            runtime_tasks.append(asyncio.create_task(receive_playback_timings()))
         done, pending = await asyncio.wait(
             runtime_tasks,
             return_when=asyncio.FIRST_COMPLETED,

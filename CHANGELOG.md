@@ -19,6 +19,11 @@ named rather than smoothed.
   tool dispatch, heard-audio truncation, cancellation, and transcript memory.
   Terminal sessions emit `listening`, `solving`, and `composing` lifecycle
   phases for the TUI orb without introducing another core transport.
+- Realtime terminal sessions now report capture-to-provider-send percentiles,
+  provider speech-end notification latency, first-audio receive-to-playback
+  delay, turn-end-event-to-playback delay, and separately named local-silence
+  and provider-cancellation timings. Provider speech timeline offsets remain
+  attached to the canonical Hermes event envelope for correlation.
 
 ### Fixed
 - Linux terminal calls now route default audio through PulseAudio's WebRTC
