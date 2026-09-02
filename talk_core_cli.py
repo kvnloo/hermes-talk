@@ -250,12 +250,26 @@ async def run_core_talk_session(audio=None) -> int:
     surface_session_id = uuid.uuid4().hex
     event_sequence = 0
 
-    def emit_event(payload: dict) -> None:
+    def emit_event(payload: dict, source_event: RealtimeEvent | None = None) -> None:
         nonlocal event_sequence
         event_sequence += 1
+        identity = {}
+        if (
+            source_event is not None
+            and source_event.session_id is not None
+            and source_event.epoch is not None
+            and source_event.sequence is not None
+        ):
+            identity = {
+                "realtime_session_id": source_event.session_id,
+                "realtime_turn_id": source_event.turn_id,
+                "realtime_epoch": source_event.epoch,
+                "realtime_sequence": source_event.sequence,
+            }
         _write_event(
             {
                 **payload,
+                **identity,
                 "protocol_version": PROTOCOL_VERSION,
                 "surface_session_id": surface_session_id,
                 "sequence": event_sequence,
@@ -321,13 +335,18 @@ async def run_core_talk_session(audio=None) -> int:
     user_endpoint_at: float | None = None
     session_open_started = 0.0
 
-    def emit_metric(name: str, started_at: float) -> None:
+    def emit_metric(
+        name: str,
+        started_at: float,
+        source_event: RealtimeEvent | None = None,
+    ) -> None:
         emit_event(
             {
                 "type": "metric",
                 "name": name,
                 "value_ms": round((time.monotonic() - started_at) * 1000, 3),
-            }
+            },
+            source_event,
         )
 
     def report_audio_pressure() -> None:
@@ -384,7 +403,7 @@ async def run_core_talk_session(audio=None) -> int:
                     "Ctrl+C to hang up.\n",
                     flush=True,
                 )
-                emit_metric("session_ready_ms", session_open_started)
+                emit_metric("session_ready_ms", session_open_started, event)
                 emit_state("listening")
                 continue
             if event.type is RealtimeEventType.WARNING:
@@ -392,7 +411,8 @@ async def run_core_talk_session(audio=None) -> int:
                     {
                         "type": "warning",
                         "message": event.text or "realtime voice provider warning",
-                    }
+                    },
+                    event,
                 )
                 continue
             if event.type is RealtimeEventType.AUDIO:
@@ -402,7 +422,7 @@ async def run_core_talk_session(audio=None) -> int:
                 audio.queue_playback(event.audio_bytes, item_id=event.item_id)
                 report_audio_pressure()
                 if user_endpoint_at is not None:
-                    emit_metric("endpoint_to_first_audio_ms", user_endpoint_at)
+                    emit_metric("endpoint_to_first_audio_ms", user_endpoint_at, event)
                     user_endpoint_at = None
                 last_audio_event = event
                 continue
@@ -415,7 +435,8 @@ async def run_core_talk_session(audio=None) -> int:
                                 "role": event.role,
                                 "text": event.text,
                                 "final": event.final,
-                            }
+                            },
+                            event,
                         )
                     if event.final and event.role in {"user", "assistant"}:
                         capture.append_turn(event.role, event.text)
@@ -445,7 +466,11 @@ async def run_core_talk_session(audio=None) -> int:
                     await coordinator.cancel_response()
                     last_audio_event = None
                     emit_state("listening")
-                    emit_metric("interruption_to_local_silence_ms", interruption_started_at)
+                    emit_metric(
+                        "interruption_to_local_silence_ms",
+                        interruption_started_at,
+                        event,
+                    )
                 continue
             if event.type is RealtimeEventType.ERROR:
                 raise RuntimeError(event.text or "realtime voice provider failed")

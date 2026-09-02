@@ -318,18 +318,80 @@ def test_cancelled_response_tail_and_late_finish_cannot_clear_new_response():
 
     async def scenario():
         events = session.events()
-        assert (await anext(events)).type is RealtimeEventType.TURN_STARTED
+        started_a = await anext(events)
+        assert started_a.type is RealtimeEventType.TURN_STARTED
         await session.cancel_response()
         started_b = await anext(events)
         current_audio = await anext(events)
         await session.cancel_response()
-        return started_b, current_audio
+        return started_a, started_b, current_audio
 
-    started_b, current_audio = run(scenario())
+    started_a, started_b, current_audio = run(scenario())
 
+    assert started_a.epoch == 0
     assert started_b.type is RealtimeEventType.TURN_STARTED
+    assert started_b.epoch == 1
     assert current_audio.audio_bytes == b"current"
+    assert current_audio.epoch == 1
     assert harness.session.sent == [rt.CancelResponse(), rt.CancelResponse()]
+
+
+def test_coordinator_and_adapter_drop_cancelled_epoch_tail_end_to_end():
+    harness = Harness(
+        (
+            rt.ResponseStarted(response_id="response-a"),
+            rt.OutputAudio(data=b"first", item_id="item-a", response_id="response-a"),
+            rt.SpeechStarted(input_id="input-1"),
+            rt.OutputAudio(data=b"late", item_id="item-a", response_id="response-a"),
+            rt.ResponseStarted(response_id="response-b"),
+            rt.OutputAudio(data=b"next", item_id="item-b", response_id="response-b"),
+        )
+    )
+    adapter = core_v1.TalkRealtimeSession(harness.session)
+
+    class Provider(RealtimeVoiceProvider):
+        @property
+        def name(self):
+            return "test"
+
+        async def open_session(self, **_kwargs):
+            return adapter
+
+    async def dispatch(_name, _arguments):
+        return "unused"
+
+    async def scenario():
+        coordinator = RealtimeVoiceCoordinator(
+            Provider(),
+            dispatch_tool=dispatch,
+        )
+        await coordinator.open(instructions="", tools=[])
+        events = coordinator.events()
+        started_a = await anext(events)
+        audio_a = await anext(events)
+        interrupted = await anext(events)
+        await coordinator.cancel_response()
+        started_b = await anext(events)
+        audio_b = await anext(events)
+        await coordinator.close()
+        return started_a, audio_a, interrupted, started_b, audio_b
+
+    started_a, audio_a, interrupted, started_b, audio_b = run(scenario())
+
+    assert [event.sequence for event in (started_a, audio_a, interrupted, started_b, audio_b)] == [
+        1,
+        2,
+        3,
+        4,
+        5,
+    ]
+    assert [event.epoch for event in (started_a, audio_a, interrupted)] == [0, 0, 0]
+    assert [event.epoch for event in (started_b, audio_b)] == [1, 1]
+    assert audio_a.audio_bytes == b"first"
+    assert audio_b.audio_bytes == b"next"
+    assert interrupted.turn_id == started_b.turn_id
+    assert started_a.turn_id != started_b.turn_id
+    assert harness.session.sent == [rt.CancelResponse()]
 
 
 def test_completed_tool_call_replay_is_ignored_without_sticking_pending():
@@ -403,7 +465,8 @@ def test_readiness_and_recoverable_failure_are_preserved_without_ending_session(
         RealtimeEventType.WARNING,
         RealtimeEventType.TRANSCRIPT,
     ]
-    assert events[0].session_id == "provider-session"
+    assert events[0].provider_session_id == "provider-session"
+    assert events[0].session_id is None
     assert [event.text for event in events[1:]] == ["bad audio chunk", "still here"]
 
 
@@ -465,6 +528,12 @@ def test_real_coordinator_delegates_one_client_tool_through_adapter():
         RealtimeEventType.TOOL_CALL,
         RealtimeEventType.TURN_ENDED,
     ]
+    assert len({event.session_id for event in observed}) == 1
+    assert observed[0].session_id
+    assert len({event.turn_id for event in observed}) == 1
+    assert observed[0].turn_id
+    assert [event.epoch for event in observed] == [0, 0, 0]
+    assert [event.sequence for event in observed] == [1, 2, 3]
     assert harness.session.sent == [
         rt.SubmitToolResult(call_id="call-1", output="72°F and clear"),
         rt.StartResponse(),

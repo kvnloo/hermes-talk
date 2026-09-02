@@ -10,6 +10,7 @@ import asyncio
 import json
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable, Mapping
+from dataclasses import replace
 from typing import Any
 
 from agent.realtime_voice import (
@@ -77,6 +78,8 @@ class TalkRealtimeSession(RealtimeSession):
         self._response_in_flight = False
         self._active_response_id: str | None = None
         self._unnamed_response_cancelled = False
+        self._epoch = 0
+        self._active_response_epoch = 0
         self._settled_response_ids: OrderedDict[str, None] = OrderedDict()
 
     async def send_audio(self, pcm: bytes) -> None:
@@ -84,18 +87,22 @@ class TalkRealtimeSession(RealtimeSession):
 
     async def events(self) -> AsyncIterator[RealtimeEvent]:
         async for event in self._session:
+            event_epoch = self._epoch
+            response_id = getattr(event, "response_id", None)
+            if response_id is not None and response_id == self._active_response_id:
+                event_epoch = self._active_response_epoch
             mapped = self._map_event(event)
-            if isinstance(event, rt.ResponseFinished):
+            if isinstance(event, rt.ResponseFinished) and mapped is not None:
                 async with self._tool_lock:
                     await self._flush_tool_results()
             if mapped is not None:
-                yield mapped
+                yield replace(mapped, epoch=event_epoch)
 
     def _map_event(self, event: rt.RealtimeEvent) -> RealtimeEvent | None:
         if isinstance(event, rt.SessionReady):
             return RealtimeEvent(
                 type=RealtimeEventType.SESSION_READY,
-                session_id=event.session_id,
+                provider_session_id=event.session_id,
             )
         if isinstance(event, rt.OutputAudio):
             if not self._belongs_to_active(event.response_id):
@@ -222,6 +229,7 @@ class TalkRealtimeSession(RealtimeSession):
         )
 
     async def cancel_response(self) -> None:
+        self._epoch += 1
         if self._cancel_active_response():
             await self._session.send((rt.CancelResponse(),))
 
@@ -251,6 +259,7 @@ class TalkRealtimeSession(RealtimeSession):
         self._unnamed_response_cancelled = False
         self._response_in_flight = True
         self._active_response_id = response_id
+        self._active_response_epoch = self._epoch
         self._response_finished = False
         return True
 
