@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import io
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -14,6 +15,21 @@ from agent.realtime_voice import RealtimeEvent, RealtimeEventType
 import talk_core_cli
 
 SUM_REQUEST = "Write a Python script that sums all numbers from 1 to 100 and run it."
+
+
+def identified(
+    event: RealtimeEvent,
+    sequence: int,
+    *,
+    turn_id: str | None = "realtime-session:1",
+) -> RealtimeEvent:
+    return replace(
+        event,
+        session_id="realtime-session",
+        turn_id=turn_id,
+        epoch=0,
+        sequence=sequence,
+    )
 
 
 class FakeAudio:
@@ -158,32 +174,52 @@ def test_tui_event_stream_delegates_to_text_agent_and_frames_transcripts(
             raise RuntimeError("provider rejected optional progress context")
 
         async def events(self):
-            yield RealtimeEvent(
-                type=RealtimeEventType.SESSION_READY,
-                session_id="provider-session",
+            yield identified(
+                RealtimeEvent(
+                    type=RealtimeEventType.SESSION_READY,
+                    provider_session_id="provider-session",
+                ),
+                1,
+                turn_id=None,
             )
-            yield RealtimeEvent(
-                type=RealtimeEventType.WARNING,
-                text="provider recovered from one malformed frame",
+            yield identified(
+                RealtimeEvent(
+                    type=RealtimeEventType.WARNING,
+                    text="provider recovered from one malformed frame",
+                ),
+                2,
+                turn_id=None,
             )
-            yield RealtimeEvent(
-                type=RealtimeEventType.TURN_ENDED,
-                role="user",
+            yield identified(
+                RealtimeEvent(type=RealtimeEventType.TURN_ENDED, role="user"),
+                3,
             )
             self.result = await self.dispatch_tool(
                 "client_delegate",
                 {"request": SUM_REQUEST},
             )
-            yield RealtimeEvent.audio(b"speaker-1", item_id="item-1")
-            yield RealtimeEvent.audio(b"speaker-2", item_id="item-1")
-            yield RealtimeEvent.audio(b"speaker-3", item_id="item-1")
-            yield RealtimeEvent.transcript(
-                SUM_REQUEST,
-                final=True,
-                role="user",
+            yield identified(
+                RealtimeEvent.audio(b"speaker-1", item_id="item-1"), 4
             )
-            yield RealtimeEvent.transcript(
-                "I found the issue.", final=True, role="assistant"
+            yield identified(
+                RealtimeEvent.audio(b"speaker-2", item_id="item-1"), 5
+            )
+            yield identified(
+                RealtimeEvent.audio(b"speaker-3", item_id="item-1"), 6
+            )
+            yield identified(
+                RealtimeEvent.transcript(
+                    SUM_REQUEST,
+                    final=True,
+                    role="user",
+                ),
+                7,
+            )
+            yield identified(
+                RealtimeEvent.transcript(
+                    "I found the issue.", final=True, role="assistant"
+                ),
+                8,
             )
 
     audio = FakeAudio()
@@ -266,6 +302,20 @@ def test_tui_event_stream_delegates_to_text_agent_and_frames_transcripts(
         "endpoint_to_first_audio_ms",
     ]
     assert all(metric["value_ms"] >= 0 for metric in metrics)
+    canonical_frames = [
+        frame for frame in frames if "realtime_session_id" in frame
+    ]
+    assert {frame["realtime_session_id"] for frame in canonical_frames} == {
+        "realtime-session"
+    }
+    assert [frame["realtime_sequence"] for frame in canonical_frames] == [
+        1,
+        2,
+        4,
+        7,
+        8,
+    ]
+    assert [frame["realtime_epoch"] for frame in canonical_frames] == [0] * 5
     assert "talk: connected (realtime-test, voice cedar)" in output
     assert output.count("talk: state composing") == 1
     assert talk_core_cli.sys.stdin.closed is True
@@ -387,9 +437,12 @@ def test_core_barge_in_uses_atomic_boundary_for_latest_played_item(
 ):
     class BoundaryCoordinator(FakeCoordinator):
         async def events(self):
-            yield RealtimeEvent.audio(b"old", item_id="old-item")
-            yield RealtimeEvent.audio(b"new", item_id="new-item")
-            yield RealtimeEvent(type=RealtimeEventType.TURN_STARTED, role="user")
+            yield identified(RealtimeEvent.audio(b"old", item_id="old-item"), 1)
+            yield identified(RealtimeEvent.audio(b"new", item_id="new-item"), 2)
+            yield identified(
+                RealtimeEvent(type=RealtimeEventType.TURN_STARTED, role="user"),
+                3,
+            )
 
     class OpenParent:
         async def wait_for_parent_close(self, _delegation_idle):
@@ -418,6 +471,8 @@ def test_core_barge_in_uses_atomic_boundary_for_latest_played_item(
     ]
     assert len(interruption_metrics) == 1
     assert interruption_metrics[0]["value_ms"] >= 0
+    assert interruption_metrics[0]["realtime_session_id"] == "realtime-session"
+    assert interruption_metrics[0]["realtime_sequence"] == 3
 
     coordinator = FakeCoordinator.instance
     assert audio.queued == [
