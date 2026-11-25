@@ -1,0 +1,52 @@
+version: 1
+repo: kvnloo/hermes-talk
+id: hermes-talk
+kind: suite
+summary: Realtime duplex voice orchestration plugin for Hermes that keeps conversation live while delegating background agent work and reporting results across terminal, Discord, dashboard, and Desktop surfaces.
+
+architecture:
+  subsystems:
+    - id: realtime-session
+      name: Realtime voice session
+      kind: interaction
+      summary: Maintains interruptible duplex speech/text sessions across supported realtime providers and voice modes.
+      paths: [talk_realtime.py, talk_core_realtime.py, talk_live_realtime.py, talk_openai_realtime.py, talk_grok_realtime.py, talk_gemini_realtime.py]
+    - id: delegation
+      name: Background delegation
+      kind: orchestration
+      summary: Delegates durable agent work while the live conversation continues and re-announces results into the bound session.
+      paths: [talk_runs.py, talk_run_control.py, talk_task_events.py, talk_steer.py, talk_worker_recipients.py]
+      depends_on: [realtime-session]
+    - id: provider-auth
+      name: Provider and auth boundary
+      kind: security
+      summary: Separates subscription/API authentication lanes, provider selection, capability checks, and explicit billing choice.
+      paths: [talk_auth.py, talk_operator_auth.py, talk_providers.py, talk_capabilities.py, talk_grok_auth.py, talk_codex_provider.py]
+      depends_on: [realtime-session]
+    - id: surfaces
+      name: Voice interaction surfaces
+      kind: presentation
+      summary: Projects Talk into terminal, Discord, dashboard, Desktop, native, and browser/audio surfaces without replacing Hermes runtime authority.
+      paths: [dashboard/, desktop/, ui/, talk_discord.py, talk_dashboard_gateway.py, talk_native_surface.py, talk_live_browser.py]
+      depends_on: [realtime-session, delegation]
+    - id: approvals
+      name: Approval and target controls
+      kind: governance
+      summary: Keeps mutating actions, target selection, operator identity, and attachment boundaries explicit across voice transports.
+      paths: [talk_approvals.py, talk_target_catalog.py, talk_target_selection.py, talk_target_state.py, talk_attachment.py]
+      depends_on: [delegation]
+
+  implements_mechanisms: [realtime-voice-orchestration]
+  provides_interfaces: []
+  consumes_interfaces: []
+  produces_representations: []
+  consumes_representations: []
+
+  boundaries:
+    owns: [realtime voice orchestration, voice provider/session transport, background delegation UX, voice-surface approval controls]
+    not_here: [Hermes core execution authority, canonical task lifecycle, model routing policy, Zer0 architecture authority]
+
+  evidence:
+    docs: [README.md, docs/, CHANGELOG.md]
+    tests: [tests/]
+    schemas: [plugin.yaml]
